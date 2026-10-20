@@ -115,11 +115,17 @@ EulerEulerOneWay<dim>::assemble_fluid_drag_exchange_rhs()
       fluid_fe_values[fluid_velocities].get_function_values(
         this->present_solution, u_f_q);
 
+      // solid_fe_values[solid_velocities].get_function_values(
+      //   solid_solver.get_locally_relevant_solution(), u_s_q);
+
+      // solid_fe_values[solid_alpha].get_function_values(
+      //   solid_solver.get_locally_relevant_solution(), a_s_q);
+
       solid_fe_values[solid_velocities].get_function_values(
-        solid_solver.get_locally_relevant_solution(), u_s_q);
+        solid_solver.get_momentum_solution(), u_s_q);
 
       solid_fe_values[solid_alpha].get_function_values(
-        solid_solver.get_locally_relevant_solution(), a_s_q);
+        solid_solver.get_momentum_solution(), a_s_q);
 
       for (unsigned int q = 0; q < n_q; ++q)
         {
@@ -167,6 +173,66 @@ EulerEulerOneWay<dim>::assemble_fluid_drag_exchange_rhs()
     }
 
   fluid_drag_rhs.compress(VectorOperation::add);
+}
+
+template <int dim>
+void
+EulerEulerOneWay<dim>::assemble_fluid_drag_field()
+{
+  // Same quadrature + mapping as the VANS assembly, so q-points match
+  const Quadrature<dim> &quadrature = *this->cell_quadrature;
+  const unsigned int     n_q        = quadrature.size();
+
+  const double beta  = solid_solver.get_beta();
+  const double rho_f = solid_solver.get_fluid_density();
+
+  const unsigned int n_cells = this->triangulation->n_active_cells();
+
+  this->ee_drag_K.assign(n_cells, std::vector<double>(n_q, 0.0));
+  this->ee_drag_us.assign(n_cells, std::vector<Tensor<1, dim>>(n_q));
+
+  FEValues<dim> solid_fe_values(*this->mapping,
+                                solid_solver.get_fe(),
+                                quadrature,
+                                update_values);
+
+  const FEValuesExtractors::Vector solid_velocities(0);
+  const FEValuesExtractors::Scalar solid_alpha(dim);
+
+  std::vector<Tensor<1, dim>> u_s_q(n_q);
+  std::vector<double>         a_s_q(n_q);
+
+  for (const auto &fluid_cell : this->dof_handler.active_cell_iterators())
+    {
+      if (!fluid_cell->is_locally_owned())
+        continue;
+
+      typename DoFHandler<dim>::active_cell_iterator solid_cell(
+        &(*this->triangulation),
+        fluid_cell->level(),
+        fluid_cell->index(),
+        &solid_solver.get_dof_handler());
+
+      solid_fe_values.reinit(solid_cell);
+
+      // u_s from the momentum solution
+      solid_fe_values[solid_velocities].get_function_values(
+        solid_solver.get_momentum_solution(), u_s_q);
+
+      // bounded alpha: the same one the solid momentum uses
+      solid_fe_values[solid_alpha].get_function_values(
+        solid_solver.get_locally_relevant_solution(), a_s_q);
+
+      const unsigned int c = fluid_cell->active_cell_index();
+
+      for (unsigned int q = 0; q < n_q; ++q)
+        {
+          this->ee_drag_K[c][q]  = beta * a_s_q[q] / rho_f;
+          this->ee_drag_us[c][q] = u_s_q[q];
+        }
+    }
+
+  this->has_euler_euler_drag_field = true;
 }
 
 
@@ -327,6 +393,15 @@ EulerEulerOneWay<dim>::solve()
 
   pass_fluid_solution_to_solid();
 
+
+  // need to make strong cupling true i need outer loop convergence
+  const bool strong_coupling = true;
+
+  const unsigned int max_coupling_iterations =
+    strong_coupling ? 20 : 1;
+
+  const double coupling_tolerance = 1e-3;
+
   while (this->simulation_control->integrate())
     {
       this->simulation_control->print_progression(this->pcout);
@@ -334,49 +409,180 @@ EulerEulerOneWay<dim>::solve()
       this->update_boundary_conditions();
       this->multiphysics->update_boundary_conditions();
 
-      // if (!this->simulation_control->is_at_start())
-      //   {
-      //     NavierStokesBase<dim, GlobalVectorType, IndexSet>::refine_mesh();
-      //     this->vertices_cell_mapping();
-      //   }
+      if (!this->simulation_control->is_at_start())
+        {
+          NavierStokesBase<dim, GlobalVectorType, IndexSet>::refine_mesh();
+
+          this->vertices_cell_mapping();
+        }
 
       /*
-       * Fluid -> solid.
+       * Owned vectors used for fluid coupling convergence.
        */
-      pass_fluid_solution_to_solid();
+      TrilinosWrappers::MPI::Vector previous_fluid_solution(
+        this->locally_owned_dofs, this->mpi_communicator);
+
+      TrilinosWrappers::MPI::Vector current_fluid_solution(
+        this->locally_owned_dofs, this->mpi_communicator);
+
+      TrilinosWrappers::MPI::Vector fluid_difference(this->locally_owned_dofs,
+                                                     this->mpi_communicator);
+
+      for (const auto i : this->locally_owned_dofs)
+        previous_fluid_solution[i] = this->present_solution[i];
+
+      previous_fluid_solution.compress(VectorOperation::insert);
+
+
+      TrilinosWrappers::MPI::BlockVector previous_solid_solution;
+      previous_solid_solution.reinit(solid_solver.get_solution());
+
+      previous_solid_solution = solid_solver.get_solution();
+
+
+      TrilinosWrappers::MPI::Vector previous_theta_solution;
+      previous_theta_solution.reinit(solid_solver.get_theta_solution());
+
+      previous_theta_solution = solid_solver.get_theta_solution();
+
+
+      bool coupling_converged = false;
+
+      for (unsigned int coupling_iteration = 0;
+           coupling_iteration < max_coupling_iterations;
+           ++coupling_iteration)
+        {
+          update_void_fraction_from_solid();
+
+          // assemble_fluid_drag_exchange_rhs();
+
+          // this->set_euler_euler_drag_rhs(fluid_drag_rhs);
+
+          assemble_fluid_drag_field();
+
+          this->iterate();
+
+          // Outer-coupling under-relaxation to stabilize stiff drag exchange.
+          const double omega_couple = 0.3;
+          for (const auto i : this->locally_owned_dofs)
+            this->present_solution[i] =
+              (1.0 - omega_couple) * previous_fluid_solution[i] +
+              omega_couple * this->present_solution[i];
+          this->present_solution.compress(VectorOperation::insert);
+
+          pass_fluid_solution_to_solid();
+
+          const bool solid_converged = solid_solver.solve_current_time_step();
+
+          if (!solid_converged)
+            this->pcout << "  Warning: solid Picard did not fully converge; "
+                        << "continuing with best iterate." << std::endl;
+
+          /*
+           * Fluid coupling error using owned vectors only.
+           */
+          current_fluid_solution = 0.0;
+
+          for (const auto i : this->locally_owned_dofs)
+            current_fluid_solution[i] = this->present_solution[i];
+
+          current_fluid_solution.compress(VectorOperation::insert);
+
+          fluid_difference = current_fluid_solution;
+
+          fluid_difference -= previous_fluid_solution;
+
+          const double fluid_error =
+            fluid_difference.l2_norm() /
+            std::max(current_fluid_solution.l2_norm(), 1e-30);
+
+          /*
+           * Solid coupling error.
+           */
+          TrilinosWrappers::MPI::BlockVector solid_difference;
+          solid_difference.reinit(solid_solver.get_solution());
+
+          solid_difference = solid_solver.get_solution();
+
+          solid_difference -= previous_solid_solution;
+
+          const double solid_error =
+            solid_difference.l2_norm() /
+            std::max(solid_solver.get_solution().l2_norm(), 1e-30);
+
+          /*
+           * Theta coupling error.
+           */
+          TrilinosWrappers::MPI::Vector theta_difference;
+          theta_difference.reinit(solid_solver.get_theta_solution());
+
+          theta_difference = solid_solver.get_theta_solution();
+
+          theta_difference -= previous_theta_solution;
+
+          const double theta_error =
+            theta_difference.l2_norm() /
+            std::max(solid_solver.get_theta_solution().l2_norm(), 1e-30);
+
+          const double coupling_error =
+            std::max({fluid_error, solid_error, theta_error});
+
+          this->pcout << "Coupling iteration " << coupling_iteration
+                      << ": fluid error = " << fluid_error
+                      << ", solid error = " << solid_error
+                      << ", theta error = " << theta_error
+                      << ", maximum = " << coupling_error << std::endl;
+
+          // if (coupling_iteration > 0 && coupling_error < coupling_tolerance)
+          //   {
+          //     coupling_converged = true;
+          //     break;
+          //   }
+
+          if (!strong_coupling)
+            {
+              coupling_converged = true;
+              break;
+            }
+          
+          
+          if (coupling_error < coupling_tolerance)
+            {
+              coupling_converged = true;
+              break;
+            }
+
+          previous_fluid_solution = current_fluid_solution;
+
+          previous_solid_solution = solid_solver.get_solution();
+
+          previous_theta_solution = solid_solver.get_theta_solution();
+        }
+
+
+      // AssertThrow(coupling_converged,
+      //             ExcMessage("Fluid-solid coupling did not converge within " +
+      //                        std::to_string(max_coupling_iterations) +
+      //                        " iterations."));
+
+      if (!coupling_converged)
+        this->pcout << "  Warning: fluid-solid coupling did not reach tolerance in "
+                    << max_coupling_iterations
+                    << " iterations; committing best iterate." << std::endl;
 
       /*
-       * Solid solve.
-       */
-      // solid_solver.advance_one_step();
-
-      const bool solid_step_completed = solid_solver.advance_one_step();
-
-      AssertThrow(solid_step_completed,
-                  ExcMessage("The solid solver did not complete the "
-                             "current coupled time step."));
-
-      /*
-       * Solid -> fluid.
+       * Synchronize the final fluid void fraction with
+       * the final solid alpha before output.
        */
       update_void_fraction_from_solid();
 
-
-      assemble_fluid_drag_exchange_rhs();
-
-      this->pcout << "||fluid_drag_rhs|| = " << fluid_drag_rhs.l2_norm()
-                  << std::endl;
-
-      this->set_euler_euler_drag_rhs(fluid_drag_rhs);
-
       /*
-       * Fluid solve.
+       * Commit both phases exactly once.
        */
-      this->iterate();
-
-
+      solid_solver.commit_current_time_step();
 
       this->postprocess(false);
+
       this->finish_time_step_fd();
 
       this->FluidDynamicsVANS<dim>::monitor_mass_conservation();

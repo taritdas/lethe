@@ -88,6 +88,26 @@ protected:
   GlobalVectorType euler_euler_drag_rhs;
   bool has_euler_euler_drag_rhs = false;
 
+  // Euler-Euler implicit drag field at the quadrature points of
+  // *this->cell_quadrature, indexed by cell->active_cell_index().
+  //   ee_drag_K[c][q]  = beta * alpha_s / rho_f   (kinematic, 1/s)
+  //   ee_drag_us[c][q] = solid velocity
+  std::vector<std::vector<double>>         ee_drag_K;
+  std::vector<std::vector<Tensor<1, dim>>> ee_drag_us;
+  bool                                     has_euler_euler_drag_field = false;
+
+  void
+  add_euler_euler_drag_matrix(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    const NavierStokesScratchData<dim>                   &scratch_data,
+    StabilizedMethodsTensorCopyData<dim>                 &copy_data) const;
+
+  void
+  add_euler_euler_drag_rhs(
+    const typename DoFHandler<dim>::active_cell_iterator &cell,
+    const NavierStokesScratchData<dim>                   &scratch_data,
+    StabilizedMethodsTensorCopyData<dim>                 &copy_data) const;
+
   /**
    * @brief finish_time_step
    * Finishes the time step

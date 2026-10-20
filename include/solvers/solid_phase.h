@@ -371,6 +371,7 @@ struct SolidPhaseParameters
 
   double rho_s = 1.0;
   double beta  = 50.0;
+  double rho_f = 1.0;
 
   double         particle_diameter       = 1.0e-3;
   double         restitution_coefficient = 0.9;
@@ -600,6 +601,14 @@ struct SolidPhaseParameters
       prm.leave_subsection();
     }
     prm.leave_subsection();
+
+    prm.enter_subsection("physical properties");
+    {
+      prm.enter_subsection("fluid 0");
+      rho_f = prm.get_double("density");
+      prm.leave_subsection();
+    }
+    prm.leave_subsection();
   }
 };
 
@@ -645,6 +654,13 @@ public:
 
   void
   run();
+
+  bool
+  solve_current_time_step();
+
+  void
+  commit_current_time_step();
+
   bool
   advance_one_step();
   void
@@ -694,6 +710,21 @@ public:
     return beta;
   }
 
+  double
+  get_fluid_density() const
+  {
+    return parameters.rho_f;
+  }
+
+  const TrilinosWrappers::MPI::BlockVector &
+  get_solution() const;
+
+  const TrilinosWrappers::MPI::Vector &
+  get_theta_solution() const;
+
+  const TrilinosWrappers::MPI::BlockVector &
+  get_momentum_solution() const;
+
 
 private:
   void
@@ -737,6 +768,13 @@ private:
   copy_local_system_to_global(const SolidCopyData<dim> &copy);
 
 
+  void
+  solve_alpha_low_order();
+
+  void
+  apply_alpha_fct();
+
+
   const SolidPhaseParameters<dim> parameters;
 
   MPI_Comm mpi_communicator;
@@ -760,6 +798,31 @@ private:
   TrilinosWrappers::BlockSparseMatrix system_matrix;
   TrilinosWrappers::SparseMatrix      theta_matrix;
 
+  TrilinosWrappers::BlockSparseMatrix                alpha_low_matrix;
+  TrilinosWrappers::MPI::BlockVector                 alpha_low_rhs;
+  TrilinosWrappers::MPI::BlockVector                 alpha_low_solution;
+  std::shared_ptr<TrilinosWrappers::PreconditionILU> alpha_low_ilu;
+
+  TrilinosWrappers::BlockSparseMatrix alpha_consistent_mass_matrix;
+  TrilinosWrappers::BlockSparseMatrix alpha_diffusion_matrix;
+
+  TrilinosWrappers::MPI::Vector alpha_fct_solution;
+  
+
+  TrilinosWrappers::MPI::Vector alpha_low_relevant;
+
+  TrilinosWrappers::MPI::Vector fct_R_plus;
+  TrilinosWrappers::MPI::Vector fct_R_minus;
+
+  TrilinosWrappers::MPI::Vector fct_R_plus_relevant;
+  TrilinosWrappers::MPI::Vector fct_R_minus_relevant;
+
+  TrilinosWrappers::MPI::Vector fct_P_plus;
+  TrilinosWrappers::MPI::Vector fct_P_minus;
+
+  TrilinosWrappers::MPI::Vector fct_correction;
+  TrilinosWrappers::MPI::Vector fct_lumped_mass;
+
   TrilinosWrappers::MPI::BlockVector solution;
   TrilinosWrappers::MPI::BlockVector old_solution;
   TrilinosWrappers::MPI::BlockVector older_solution;
@@ -768,6 +831,9 @@ private:
   TrilinosWrappers::MPI::BlockVector locally_relevant_solution;
   TrilinosWrappers::MPI::BlockVector locally_relevant_old_solution;
   TrilinosWrappers::MPI::BlockVector locally_relevant_older_solution;
+
+  TrilinosWrappers::MPI::BlockVector locally_relevant_momentum_solution;
+  TrilinosWrappers::MPI::BlockVector locally_relevant_fct_delta;
 
   TrilinosWrappers::MPI::Vector theta_solution;
   TrilinosWrappers::MPI::Vector theta_old_solution;

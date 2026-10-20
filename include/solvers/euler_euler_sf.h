@@ -45,6 +45,9 @@ private:
   assemble_fluid_drag_exchange_rhs();
 
   void
+  assemble_fluid_drag_field();
+
+  void
   inspect_mesh_boundaries() const;
 };
 

@@ -454,6 +454,11 @@ FluidDynamicsVANS<dim>::assemble_local_system_matrix(
       pf_assembler->calculate_particle_fluid_interactions(scratch_data);
     }
 
+  // NEW: must come before the core assembler, which reads
+  // strong_residual / strong_jacobian for SUPG/PSPG
+  if (has_euler_euler_drag_field)
+    add_euler_euler_drag_matrix(cell, scratch_data, copy_data);
+
   for (auto &assembler : this->assemblers)
     {
       assembler->assemble_matrix(scratch_data, copy_data);
@@ -514,10 +519,7 @@ FluidDynamicsVANS<dim>::assemble_system_rhs()
 
   this->system_rhs.compress(VectorOperation::add);
 
-  if (has_euler_euler_drag_rhs)
-  {
-    this->system_rhs += euler_euler_drag_rhs;
-  }
+ 
   
 
   if (this->simulation_control->is_first_assembly())
@@ -570,6 +572,10 @@ FluidDynamicsVANS<dim>::assemble_local_system_rhs(
     {
       pf_assembler->calculate_particle_fluid_interactions(scratch_data);
     }
+
+  if (has_euler_euler_drag_field)
+    add_euler_euler_drag_rhs(cell, scratch_data, copy_data);
+
 
   for (auto &assembler : this->assemblers)
     {
@@ -840,6 +846,73 @@ FluidDynamicsVANS<dim>::solve()
 
   this->finish_simulation();
 }
+
+
+template <int dim>
+void
+FluidDynamicsVANS<dim>::add_euler_euler_drag_matrix(
+  const typename DoFHandler<dim>::active_cell_iterator &cell,
+  const NavierStokesScratchData<dim>                   &scratch_data,
+  StabilizedMethodsTensorCopyData<dim>                 &copy_data) const
+{
+  const unsigned int c      = cell->active_cell_index();
+  const unsigned int n_q    = scratch_data.n_q_points;
+  const unsigned int n_dofs = scratch_data.n_dofs;
+
+  AssertThrow(c < ee_drag_K.size() && ee_drag_K[c].size() == n_q,
+              ExcMessage("Euler-Euler drag field not set or quadrature mismatch."));
+
+  for (unsigned int q = 0; q < n_q; ++q)
+    {
+      const double K   = ee_drag_K[c][q];
+      const double JxW = scratch_data.JxW[q];
+
+      for (unsigned int j = 0; j < n_dofs; ++j)
+        copy_data.strong_jacobian[q][j] += K * scratch_data.phi_u[q][j];
+
+      for (unsigned int i = 0; i < n_dofs; ++i)
+        {
+          const Tensor<1, dim> &phi_u_i = scratch_data.phi_u[q][i];
+
+          for (unsigned int j = 0; j < n_dofs; ++j)
+            copy_data.local_matrix(i, j) +=
+              K * (scratch_data.phi_u[q][j] * phi_u_i) * JxW;
+        }
+    }
+}
+
+
+template <int dim>
+void
+FluidDynamicsVANS<dim>::add_euler_euler_drag_rhs(
+  const typename DoFHandler<dim>::active_cell_iterator &cell,
+  const NavierStokesScratchData<dim>                   &scratch_data,
+  StabilizedMethodsTensorCopyData<dim>                 &copy_data) const
+{
+  const unsigned int c      = cell->active_cell_index();
+  const unsigned int n_q    = scratch_data.n_q_points;
+  const unsigned int n_dofs = scratch_data.n_dofs;
+
+  AssertThrow(c < ee_drag_K.size() && ee_drag_K[c].size() == n_q,
+              ExcMessage("Euler-Euler drag field not set or quadrature mismatch."));
+
+  for (unsigned int q = 0; q < n_q; ++q)
+    {
+      const double JxW = scratch_data.JxW[q];
+
+      // K (u_f - u_s), u_f = current Newton iterate
+      const Tensor<1, dim> drag_residual =
+        ee_drag_K[c][q] * (scratch_data.velocity_values[q] - ee_drag_us[c][q]);
+
+      copy_data.strong_residual[q] += drag_residual;
+
+      for (unsigned int i = 0; i < n_dofs; ++i)
+        copy_data.local_rhs(i) -=
+          (drag_residual * scratch_data.phi_u[q][i]) * JxW;
+    }
+}
+
+
 
 // Pre-compile the 2D and 3D solver to ensure that the
 // library is valid before we actually compile the solver
